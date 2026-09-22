@@ -1,0 +1,118 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE: ghcr.io/${{ github.repository }}
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: pip install -e ".[dev,api]" mypy import-linter
+      - name: Ruff (style + import layer rules)
+        run: ruff check src tests
+      - name: Import-linter (architecture contract)
+        run: lint-imports
+      - name: Mypy (type-check the seams)
+        run: mypy src/fraud_service --strict
+  secrets: # INCIDENT.md response step 3: no silent leak merges
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history: deleting a commit does NOT un-leak it
+      # The gitleaks-action derives a commit range from the push payload and
+      # appends ^ to its first commit. On an initial push that first commit is
+      # the repo's root, root^ does not exist, git aborts and the action exits 1
+      # having scanned 0 bytes. Calling the CLI directly removes that failure
+      # mode and runs the same command as the local drill in INCIDENT.md.
+      - name: Install gitleaks (pinned)
+        run: |
+          curl -sSL -o /tmp/gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          tar xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          sudo mv /tmp/gitleaks /usr/local/bin/gitleaks
+      - name: Gitleaks (full history, values redacted)
+        run: gitleaks detect --source . --redact -v
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - run: pip install -e ".[dev,api]"
+      - name: Fast suite — the per-commit gate
+        run: pytest -m "not slow" --cov-fail-under=80
+      - name: Behavioural gate — real model artefact
+        run: pytest -m behavioural -q --no-cov
+      - name: Upload coverage (evidence, even on fail)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage
+  image-smoke:
+    runs-on: ubuntu-latest
+    needs: [lint, test, secrets]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build with GHA layer cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke test the container
+        run: |
+          docker run -d --name svc -p 8000:8000 ${{ env.IMAGE }}:${{ github.sha }}
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8000/v1/ready && break || sleep 2
+          done
+          curl -fsS localhost:8000/v1/predict \
+               -H "content-type: application/json" \
+               -d @payloads/sample.json \
+            | python3 -c "import json,sys; b=json.load(sys.stdin); assert 0<=b['fraud_probability']<=1; assert b['model_version']; print('smoke OK')"
+          docker logs svc --tail 5
+  publish:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [image-smoke]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push (SHA + channel tag)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ env.IMAGE }}:main
